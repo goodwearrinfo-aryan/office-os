@@ -1,0 +1,3 @@
+# Inbox: harness (LLM)
+
+- [x] Check NVIDIA model health: 429 vs 200 in ~/Library/Logs/openclaw/gateway.log, auth profile cooldowns (status only, never print key values), and token use by nvidia-office. Recommend load changes. 429 rate limits observed on 2026-11-01 and 2026-11-10 for nvidia/nemotron-3-ultra-550b-a55b; 300s idle timeouts on 2026-11-10; auth profiles nvidia:manual and sha256:05af2dfbc829 entering cooldown; no API key configured for nvidia provider; token use shared across all offices via nvidia:manual profile; recommendations: throttle requests, configure API key, add backup model fallback, increase preflight timeout, redistribute workload.

@@ -1,0 +1,730 @@
+"""
+Pre-registered forward validation for the regime_aware_rsi candidate.
+
+Unlike the deleted in-sample generator, this script performs NO parameter
+search. Every arm is defined in forward-validation-prereg.json, which was
+written before any post-boundary bar was consumed. All arms are reported,
+including arms that lose.
+
+The forward bar cache is append-only. A bar already in the cache is never
+rewritten; if the exchange later reports different OHLC for the same
+open_time the difference is recorded as a divergence instead of being
+silently overwritten.
+
+Run:  /usr/bin/python3 forward_validation.py
+"""
+
+from datetime import datetime, timezone
+from pathlib import Path
+import hashlib
+import json
+import math
+import sys
+import urllib.error
+import urllib.request
+
+HOME = Path.home()
+BASE = HOME / "trading/paper-benchmark"
+PREREG = BASE / "forward-validation-prereg.json"
+PREREG2 = BASE / "forward-validation-prereg-2.json"
+BARS = BASE / "forward-bars.json"
+BARS_5M = BASE / "forward-bars-5m.json"
+OUT = BASE / "forward-validation.json"
+PUBLIC = HOME / "trading/openalice/ui/public/forward-validation.json"
+
+# Each registration gets its own bar cache, because the arms are measured on
+# different timeframes. forward-bars.json is the original 1h cache and keeps
+# its name so the already-collected history is not orphaned.
+REGISTRATIONS = [
+    {"path": PREREG, "bars": BARS},
+    {"path": PREREG2, "bars": BARS_5M},
+]
+
+KLINES = "https://api.binance.com/api/v3/klines"
+PAGE_LIMIT = 1000
+FETCH_TIMEOUT = 20
+
+BOOTSTRAP_ITERATIONS = 2000
+BOOTSTRAP_BLOCK = 5
+BOOTSTRAP_SEED = 20260927
+OOS_SPLITS = 16
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text(errors="ignore"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, indent=2, default=str))
+    temp.replace(path)
+
+
+def content_hash(path):
+    """Hash the prereg's content, not its bytes.
+
+    A byte hash would report drift whenever the file is merely reformatted,
+    which would freeze promotion permanently with no way back. Canonical
+    serialisation makes the fingerprint immune to whitespace and key order
+    while still catching any real change to the registered terms.
+    """
+    payload = json.loads(path.read_text())
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def window_bars_hash(ordered):
+    """Fingerprint exactly the bars a validation run consumed.
+
+    Stands next to content_hash deliberately, and differs from it in one way that
+    matters: content_hash covers a whole document whose content should never
+    change, while this covers a growing slice of a corpus that is appended to on
+    every run. So the hash is taken over the validated window only. Appending new
+    bars leaves it unchanged, which is what makes it comparable across runs, and
+    altering a bar that was already inside a published window changes it, which is
+    what makes a rewrite detectable at all.
+
+    Keyed by open_time rather than position, so a reordering that preserves the
+    timestamps is still caught, and rounded to 2dp because the cache stores
+    rounded values and re-reading them must not produce a different hash.
+    """
+    canonical = json.dumps(
+        [[int(bar[0])] + [round(float(v), 2) for v in bar[1:]] for bar in ordered],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def arm_c_signals(frame):
+    """Vectorized equivalent of profit_focus.make_setup evaluated per bar.
+
+    Every indicator in make_setup is causal (rolling means, Wilder ADX, and
+    ewm with adjust=False), so computing them once over the whole series and
+    scoring each bar gives the same answer as calling make_setup on each
+    prefix. The scoring uses elif chains, not additive bands, because the
+    original does: a close at or below the lower band scores 20 and does not
+    also score the 10 for being below the middle.
+
+    test_arm_c_matches_live_rule pins this equivalence against the real
+    function.
+    """
+    import numpy as np
+
+    close = frame["close"]
+    volume = frame["volume"]
+    average = atr(frame, 14)
+    trend = adx(frame, 14)
+    ema = close.ewm(span=200, adjust=False).mean()
+    values = rsi(close, 28)
+    middle = close.rolling(20).mean()
+    deviation = close.rolling(20).std()
+    lower = middle - 2 * deviation
+    upper = middle + 2 * deviation
+    vol_ma = volume.rolling(20).mean()
+
+    warm = average.isna() | trend.isna() | ema.isna() | values.isna()
+    tradable = (~warm) & (trend < 20)
+
+    long_pts = np.where(values < 40, 40, 0)
+    long_pts = long_pts + np.where(close <= lower, 20, np.where(close < middle, 10, 0))
+    long_pts = long_pts + np.where(close > ema, 10, 0)
+
+    short_pts = np.where(values > 60, 40, 0)
+    short_pts = short_pts + np.where(close >= upper, 20, np.where(close > middle, 10, 0))
+    short_pts = short_pts + np.where(close < ema, 10, 0)
+
+    spike = (volume > vol_ma * 1.5).fillna(False).to_numpy()
+    long_pts = long_pts + spike * 10
+    short_pts = short_pts + spike * 10
+
+    long_side = tradable.to_numpy() & (long_pts >= 65) & (long_pts > short_pts) & (close > ema).to_numpy()
+    short_side = tradable.to_numpy() & (short_pts >= 65) & (short_pts > long_pts) & (close < ema).to_numpy()
+
+    signals, exits = {}, {}
+    timestamps = list(frame.index)
+    for i, ts in enumerate(timestamps):
+        if long_side[i]:
+            side = 1
+        elif short_side[i]:
+            side = -1
+        else:
+            continue
+        a = average.iloc[i]
+        bar_close = float(close.iloc[i])
+        atr_pct = (a / bar_close) if a == a and a > 0 else 0.0
+        stop_pct = max(0.02, atr_pct * 1.5)
+        signals[ts] = side
+        exits[ts] = (stop_pct, max(0.04, stop_pct * 2))
+    return signals, exits
+
+
+def utc(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
+def fetch_klines(symbol, interval, start_ms, end_ms):
+    bars = []
+    cursor = start_ms
+    while cursor < end_ms:
+        url = (
+            f"{KLINES}?symbol={symbol}&interval={interval}"
+            f"&startTime={cursor}&endTime={end_ms}&limit={PAGE_LIMIT}"
+        )
+        request = urllib.request.Request(url, headers={"User-Agent": "forward-validation/1.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as response:
+                page = json.loads(response.read().decode())
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as exc:
+            raise RuntimeError(f"klines fetch failed at {cursor}: {type(exc).__name__}: {exc}") from exc
+        if not page:
+            break
+        for row in page:
+            bars.append([int(row[0])] + [float(x) for x in row[1:6]])
+        cursor = int(page[-1][0]) + 1
+    return bars
+
+
+def load_cache(path):
+    data = read_json(path)
+    return {int(bar[0]): bar for bar in data.get("bars", [])}, data.get("meta", {})
+
+
+def merge_bars(cache, fresh, pinned_through_ms):
+    added, divergences = [], []
+    for bar in fresh:
+        open_time = bar[0]
+        known = cache.get(open_time)
+        if known is None:
+            cache[open_time] = bar
+            added.append(bar)
+            continue
+        if open_time <= pinned_through_ms:
+            continue
+        if [round(x, 8) for x in known[1:]] != [round(x, 8) for x in bar[1:]]:
+            divergences.append({"open_time": open_time, "utc": utc(open_time), "cached": known[1:], "exchange": bar[1:]})
+    return added, divergences
+
+
+def series(bars):
+    import pandas as pd
+
+    frame = pd.DataFrame(bars, columns=["open_time", "open", "high", "low", "close", "volume"])
+    frame["timestamp"] = pd.to_datetime(frame["open_time"], unit="ms")
+    return frame.set_index("timestamp")[["open", "high", "low", "close", "volume"]]
+
+
+def rsi(close, period):
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    return 100 - 100 / (1 + gain / loss)
+
+
+def adx(frame, period):
+    import pandas as pd
+
+    high, low, close = frame["high"], frame["low"], frame["close"]
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    plus_di = 100 * plus_dm.rolling(period).mean() / atr
+    minus_di = 100 * minus_dm.rolling(period).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.rolling(period).mean()
+
+
+def atr(frame, period=14):
+    import pandas as pd
+
+    high, low, close = frame["high"], frame["low"], frame["close"]
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def simulate(signals, frame, stop_pct_of, target_pct_of, execution):
+    """Walk forward one position at a time. Entry fills at the next bar open."""
+    fee = execution["fee_per_side"]
+    slip = execution["slippage_per_side"]
+    timestamps = list(frame.index)
+    trades = []
+    position = None
+    pending = None
+
+    for i, ts in enumerate(timestamps):
+        bar = frame.iloc[i]
+        if position is not None:
+            stop_hit = bar["low"] <= position["stop"] if position["side"] > 0 else bar["high"] >= position["stop"]
+            target_hit = bar["high"] >= position["target"] if position["side"] > 0 else bar["low"] <= position["target"]
+            if stop_hit or target_hit:
+                if stop_hit and target_hit:
+                    exit_price, reason = position["stop"], "stop_first"
+                elif stop_hit:
+                    exit_price, reason = position["stop"], "stop"
+                else:
+                    exit_price, reason = position["target"], "target"
+                fill = exit_price * (1 - slip) if position["side"] > 0 else exit_price * (1 + slip)
+                if position["side"] > 0:
+                    net = (fill * (1 - fee)) / (position["entry_fill"] * (1 + fee)) - 1
+                else:
+                    net = (position["entry_fill"] * (1 - fee)) / (fill * (1 + fee)) - 1
+                trades.append({
+                    "side": position["side"],
+                    "signal_ts": position["signal_ts"],
+                    "entry_ts": position["entry_ts"],
+                    "exit_ts": ts,
+                    "bars_held": i - position["entry_index"],
+                    "entry": position["entry"],
+                    "exit": exit_price,
+                    "reason": reason,
+                    "net_pct": net * 100,
+                })
+                position = None
+            continue
+
+        if pending is not None and pending["signal_index"] == i - 1:
+            side = pending["side"]
+            entry = bar["open"]
+            stop_pct = stop_pct_of(pending)
+            target_pct = target_pct_of(pending)
+            stop = entry * (1 - stop_pct) if side > 0 else entry * (1 + stop_pct)
+            target = entry * (1 + target_pct) if side > 0 else entry * (1 - target_pct)
+            position = {
+                "side": side,
+                "entry": entry,
+                "entry_fill": entry * (1 + slip) if side > 0 else entry * (1 - slip),
+                "stop": stop,
+                "target": target,
+                "signal_ts": pending["signal_ts"],
+                "entry_ts": ts,
+                "entry_index": i,
+            }
+            pending = None
+            continue
+
+        signal = signals.get(ts)
+        if signal is not None:
+            pending = {"side": signal, "signal_ts": ts, "signal_index": i, "bar": bar}
+
+    open_position = None
+    if position is not None:
+        last = frame.iloc[-1]
+        fill = last["close"] * (1 - slip) if position["side"] > 0 else last["close"] * (1 + slip)
+        if position["side"] > 0:
+            net = (fill * (1 - fee)) / (position["entry_fill"] * (1 + fee)) - 1
+        else:
+            net = (position["entry_fill"] * (1 - fee)) / (fill * (1 + fee)) - 1
+        open_position = {
+            "side": position["side"],
+            "entry_ts": position["entry_ts"],
+            "mark_ts": timestamps[-1],
+            "unrealized_pct": net * 100,
+        }
+    return trades, open_position
+
+
+def metrics(trades):
+    returns = [t["net_pct"] for t in trades]
+    if not returns:
+        return {"trades": 0, "return_pct": None, "win_rate_pct": None, "profit_factor": None, "max_dd_pct": None}
+    equity = 1.0
+    curve = []
+    for r in returns:
+        equity *= 1 + r / 100
+        curve.append(equity)
+    peak = 1.0
+    max_dd = 0.0
+    for value in curve:
+        peak = max(peak, value)
+        max_dd = max(max_dd, (peak - value) / peak * 100)
+    wins = [r for r in returns if r > 0]
+    losses = [r for r in returns if r < 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    return {
+        "trades": len(returns),
+        "return_pct": (equity - 1) * 100,
+        "win_rate_pct": len(wins) / len(returns) * 100,
+        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else None,
+        "max_dd_pct": max_dd,
+    }
+
+
+def block_bootstrap(returns):
+    import random
+
+    if not returns:
+        return None
+    rng = random.Random(BOOTSTRAP_SEED)
+    n = len(returns)
+    means = []
+    blocks = max(1, n // BOOTSTRAP_BLOCK)
+    for _ in range(BOOTSTRAP_ITERATIONS):
+        sample = []
+        for _ in range(blocks):
+            start = rng.randrange(n)
+            for k in range(BOOTSTRAP_BLOCK):
+                sample.append(returns[(start + k) % n])
+        means.append(sum(sample) / len(sample))
+    means.sort()
+
+    def pct(fraction):
+        idx = min(len(means) - 1, max(0, int(round(fraction * (len(means) - 1)))))
+        return means[idx]
+
+    return {
+        "mean_trade_pct": sum(returns) / n,
+        "ci95_low_pct": pct(0.025),
+        "ci95_high_pct": pct(0.975),
+        "probability_positive": sum(1 for m in means if m > 0) / len(means),
+        "iterations": BOOTSTRAP_ITERATIONS,
+        "block": BOOTSTRAP_BLOCK,
+        "seed": BOOTSTRAP_SEED,
+    }
+
+
+def oos_splits(trades, timestamps, count=OOS_SPLITS):
+    if not trades or len(timestamps) < 2:
+        return {"splits": [], "positive_fraction": None, "splits_with_trades": 0}
+    start, end = timestamps[0], timestamps[-1]
+    total_ms = (end - start).total_seconds() * 1000
+    width = total_ms / count
+    buckets = [[] for _ in range(count)]
+    for trade in trades:
+        offset = (trade["exit_ts"] - start).total_seconds() * 1000
+        idx = min(count - 1, int(offset / width))
+        buckets[idx].append(trade["net_pct"])
+    splits = []
+    for i, bucket in enumerate(buckets):
+        segment_start = start + pd_timedelta_ms(i * width)
+        segment_end = start + pd_timedelta_ms((i + 1) * width)
+        if not bucket:
+            splits.append({"index": i, "start": segment_start.isoformat(), "end": segment_end.isoformat(), "trades": 0, "return_pct": None})
+            continue
+        compounded = 1.0
+        for r in bucket:
+            compounded *= 1 + r / 100
+        splits.append({
+            "index": i,
+            "start": segment_start.isoformat(),
+            "end": segment_end.isoformat(),
+            "trades": len(bucket),
+            "return_pct": (compounded - 1) * 100,
+        })
+    with_trades = [s for s in splits if s["trades"] > 0]
+    positive = [s for s in with_trades if s["return_pct"] > 0]
+    return {
+        "splits": splits,
+        "positive_fraction": (len(positive) / len(with_trades)) if with_trades else None,
+        "splits_with_trades": len(with_trades),
+    }
+
+
+def pd_timedelta_ms(ms):
+    from datetime import timedelta
+
+    return timedelta(milliseconds=ms)
+
+
+def arm_a_signals(frame, cfg):
+    values = rsi(frame["close"], cfg["rsi_period"])
+    trend = adx(frame, cfg["adx_period"])
+    signals = {}
+    for ts in frame.index:
+        r = values.loc[ts]
+        a = trend.loc[ts]
+        if r != r or a != a:
+            continue
+        if a >= cfg["adx_max"]:
+            continue
+        if r < cfg["rsi_low"]:
+            signals[ts] = 1
+        elif r > cfg["rsi_high"]:
+            signals[ts] = -1
+    return signals
+
+
+def arm_a_stops(frame, cfg, mode):
+    average = atr(frame, 14)
+
+    def stop_of(pending):
+        a = average.get(pending["signal_ts"])
+        bar_close = pending["bar"]["close"]
+        atr_pct = (a / bar_close) if a == a and a > 0 else 0.0
+        if mode == "fixed":
+            return cfg["fixed_stop"]
+        return max(cfg["fixed_stop"], atr_pct * 1.5)
+
+    def target_of(pending):
+        if mode == "fixed":
+            return cfg["fixed_target"]
+        return max(cfg["fixed_target"], stop_of(pending) * 2)
+
+    return stop_of, target_of
+
+
+def arm_b_signals(frame, prereg):
+    sys.path.insert(0, str(HOME / "trading/trading-bot"))
+    try:
+        from regime_aware_rsi import create_regime_aware_rsi
+    except Exception as exc:  # noqa: BLE001
+        return None, f"import failed: {type(exc).__name__}: {exc}"
+    strategy = create_regime_aware_rsi()
+    signals, stops = {}, {}
+    for idx in range(len(frame)):
+        if idx < 260:
+            continue
+        try:
+            setup = strategy.analyze_setup(frame, idx)
+        except Exception:  # noqa: BLE001
+            continue
+        if setup is None:
+            continue
+        ts = frame.index[idx]
+        side = 1 if setup.direction.name == "BUY" else -1
+        signals[ts] = side
+        entry = setup.entry_price
+        stops[ts] = (
+            abs(entry - setup.stop_loss) / entry,
+            abs(setup.take_profit - entry) / entry,
+        )
+    return (signals, stops), None
+
+
+def evaluate_gates(result, gates):
+    checks = {
+        "passes_trade_gate": (result["trades"] or 0) >= gates["min_trades"],
+        "passes_profit_factor_gate": result["profit_factor"] is not None and result["profit_factor"] >= gates["min_profit_factor"],
+        "passes_drawdown_gate": result["max_dd_pct"] is not None and result["max_dd_pct"] <= gates["max_drawdown_pct"],
+        "passes_oos_consistency_gate": result.get("positive_oos_fraction") is not None and result["positive_oos_fraction"] >= gates["min_positive_oos_fraction"],
+        "passes_bootstrap_gate": result.get("bootstrap") is not None and result["bootstrap"]["ci95_low_pct"] > gates["bootstrap_ci_low_must_exceed"],
+    }
+    reached_floor = (result["trades"] or 0) >= gates["inference_floor_trades"]
+    return {
+        **checks,
+        "inference_floor_reached": reached_floor,
+        "any_claim_permitted": reached_floor,
+        "promote": all(checks.values()),
+        "note": None if reached_floor else f"only {result['trades']} closed trades; below the {gates['inference_floor_trades']}-trade inference floor, so no directional claim is permitted",
+    }
+
+
+def run_registration(spec_path, cache_path, now_ms):
+    """Fetch, cache and evaluate one registration. Returns (arms, window, meta)."""
+    spec_path = Path(spec_path)
+    cache_path = Path(cache_path)
+    prereg = read_json(spec_path)
+    if not prereg:
+        return [], None, {"path": str(spec_path), "error": "preregistration missing"}
+
+    boundary = prereg["in_sample_boundary"]["end_ms"]
+    symbol = prereg["data"]["symbol"]
+    interval = prereg["data"]["interval"]
+    cache, prev_meta = load_cache(cache_path)
+    pinned = prev_meta.get("pinned_through_ms")
+
+    fresh = fetch_klines(symbol, interval, boundary, now_ms)
+    if not fresh:
+        return [], None, {"path": str(spec_path), "error": f"no {interval} bars returned"}
+    if pinned is None:
+        pinned = max(bar[0] for bar in fresh)
+    added, divergences = merge_bars(cache, fresh, pinned)
+
+    ordered = [cache[k] for k in sorted(cache)]
+    write_json(cache_path, {
+        "meta": {
+            "symbol": symbol,
+            "interval": interval,
+            "boundary_ms": boundary,
+            "pinned_through_ms": pinned,
+            "pinned_through_utc": utc(pinned),
+            "bars": len(ordered),
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        },
+        "bars": ordered,
+    })
+
+    frame = series(ordered)
+    timestamps = list(frame.index)
+    execution = prereg["execution"]
+    gates = prereg["gates"]
+    registration_id = prereg.get("registration_id", spec_path.stem)
+
+    arms = []
+    for spec in prereg["arms"]:
+        entry = {
+            "id": spec["id"],
+            "label": spec["label"],
+            "registration": registration_id,
+            "timeframe": interval,
+            "trades": 0,
+            "error": None,
+        }
+        try:
+            if spec["id"].startswith("A_"):
+                mode = "atr" if spec["id"] == "A_atr" else "fixed"
+                cfg = {
+                    "rsi_period": spec["entry"]["rsi_period"],
+                    "rsi_low": spec["entry"]["rsi_low"],
+                    "rsi_high": spec["entry"]["rsi_high"],
+                    "adx_period": spec["entry"]["adx_period"],
+                    "adx_max": spec["entry"]["adx_max"],
+                    "fixed_stop": spec["exits"]["stop_pct"] if mode == "fixed" else 0.02,
+                    "fixed_target": spec["exits"]["target_pct"] if mode == "fixed" else 0.04,
+                }
+                signals = arm_a_signals(frame, cfg)
+                stop_of, target_of = arm_a_stops(frame, cfg, mode)
+                trades, open_position = simulate(signals, frame, stop_of, target_of, execution)
+            elif spec["id"].startswith("B_"):
+                built, err = arm_b_signals(frame, prereg)
+                if err:
+                    entry["error"] = err
+                    arms.append(entry)
+                    continue
+                signals, stops = built
+
+                def stop_of(pending, _stops=stops):
+                    return _stops.get(pending["signal_ts"], (0.02, 0.04))[0]
+
+                def target_of(pending, _stops=stops):
+                    return _stops.get(pending["signal_ts"], (0.02, 0.04))[1]
+
+                trades, open_position = simulate(signals, frame, stop_of, target_of, execution)
+            else:
+                signals, exits = arm_c_signals(frame)
+
+                def stop_of(pending, _exits=exits):
+                    return _exits.get(pending["signal_ts"], (0.02, 0.04))[0]
+
+                def target_of(pending, _exits=exits):
+                    return _exits.get(pending["signal_ts"], (0.02, 0.04))[1]
+
+                trades, open_position = simulate(signals, frame, stop_of, target_of, execution)
+
+            result = metrics(trades)
+            result["bootstrap"] = block_bootstrap([t["net_pct"] for t in trades])
+            oos = oos_splits(trades, timestamps)
+            result["positive_oos_fraction"] = oos["positive_fraction"]
+            result["oos"] = oos
+            result["open_position"] = open_position
+            result["exit_reasons"] = {
+                reason: sum(1 for t in trades if t["reason"] == reason)
+                for reason in sorted({t["reason"] for t in trades})
+            }
+            entry.update(result)
+            entry["gates"] = evaluate_gates(result, gates)
+        except Exception as exc:  # noqa: BLE001
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        arms.append(entry)
+
+    window = {
+        "in_sample_end_utc": utc(boundary),
+        "first_forward_bar_utc": utc(ordered[0][0]),
+        "last_forward_bar_utc": utc(ordered[-1][0]),
+        "bars": len(ordered),
+        "bars_added_this_run": len(added),
+        "pinned_through_utc": utc(pinned),
+        "interval": interval,
+        # Identity of the data these numbers were computed from.
+        #
+        # The preregistration fingerprint above pins the *terms*; nothing pinned
+        # the *corpus*. The window block is descriptive - a bar count and a last
+        # timestamp - so the same figures could be re-attributed to different bars
+        # that happened to keep the same shape, and .gitignore's claim that this
+        # cache "must never be rewritten" was enforced by nothing but git history.
+        #
+        # Deliberately a hash of the validated window rather than of the file. The
+        # cache is append-only and grows every run, so a whole-file hash would
+        # change on every run and could never be compared. Hashing exactly the bars
+        # this artifact used means appending is free and rewriting any of them is
+        # detectable, which is the invariant that actually matters.
+        "bars_sha256": window_bars_hash(ordered),
+        "bars_hash_kind": "canonical-json-window",
+        "divergences": divergences,
+    }
+    meta = {
+        "path": str(spec_path),
+        "registration_id": registration_id,
+        "sha256": content_hash(spec_path),
+        "hash_kind": "canonical-json",
+        "registered_at": prereg.get("registered_at"),
+        "symbol": symbol,
+        "interval": interval,
+        # Which corpus these arms were measured on. Recorded rather than inferred
+        # so the promotion controller can re-derive the window hash from the same
+        # file without hardcoding the registration-to-cache pairing here, which
+        # would be a second place to forget to update.
+        "cache_path": str(cache_path),
+        "arms": [spec["id"] for spec in prereg["arms"]],
+        "window": window,
+    }
+    return arms, window, meta
+
+
+def main():
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    all_arms, registrations, primary = [], [], None
+
+    for entry in REGISTRATIONS:
+        arms, window, meta = run_registration(entry["path"], entry["bars"], now_ms)
+        if meta.get("error"):
+            # entry["path"] is the name in scope here; spec_path belonged to
+            # run_registration's own frame, so this error path raised
+            # NameError instead of reporting the failure it was written for.
+            print(f"FATAL: {Path(entry['path']).name}: {meta['error']}", file=sys.stderr)
+            return 2
+        all_arms.extend(arms)
+        registrations.append(meta)
+        if primary is None:
+            primary = meta
+
+    primary_spec = read_json(REGISTRATIONS[0]["path"])
+    gates = primary_spec.get("gates", {})
+    execution = primary_spec.get("execution", {})
+
+    payload = {
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "kind": "forward_validation",
+        "registrations": registrations,
+        "preregistration": {
+            "path": primary["path"],
+            "sha256": primary["sha256"],
+            "hash_kind": primary["hash_kind"],
+            "registered_at": primary["registered_at"],
+        },
+        "window": primary["window"],
+        "execution": execution,
+        "gates": gates,
+        "arms": all_arms,
+        "all_arms_reported": True,
+        "registration_count": len(registrations),
+        "selection_rule": "no arm is selected; a promotion requires the promote flag on an arm that has reached the inference floor, and no arm may be added or re-parameterised after its preregistration",
+    }
+    write_json(OUT, payload)
+    write_json(PUBLIC, payload)
+
+    for meta in registrations:
+        window = meta["window"]
+        print(f"[{meta['registration_id']}] {meta['interval']} {window['first_forward_bar_utc']} -> {window['last_forward_bar_utc']}  bars={window['bars']} (+{window['bars_added_this_run']})")
+    for arm in all_arms:
+        if arm.get("error"):
+            print(f"  {arm['id']:<8} ERROR {arm['error']}")
+            continue
+        gates_out = arm["gates"]
+        print(
+            f"  {arm['id']:<8} [{arm['timeframe']:<3}] n={arm['trades']:<4}"
+            f" ret={None if arm['return_pct'] is None else round(arm['return_pct'], 2)}"
+            f" pf={None if arm['profit_factor'] is None else round(arm['profit_factor'], 3)}"
+            f" dd={None if arm['max_dd_pct'] is None else round(arm['max_dd_pct'], 2)}"
+            f" floor={'yes' if gates_out['inference_floor_reached'] else 'NO'}"
+            f" promote={gates_out['promote']}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

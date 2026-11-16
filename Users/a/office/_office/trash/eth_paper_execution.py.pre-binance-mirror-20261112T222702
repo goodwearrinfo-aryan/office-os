@@ -1,0 +1,623 @@
+"""Paper execution engine for regime_aware_trend_1h on ETH.
+
+Consumes the shadow feed's signal (single source of truth, so execution and
+signal can never drift) and simulates fills. Research-only: no exchange client,
+no credentials, no order path, stdlib only.
+
+Three deliberate realism choices, because paper P&L is worthless if it is
+flattered:
+
+  * A signal from bar i is only knowable after bar i closes, so entries fill at
+    bar i+1's OPEN, never at bar i's close. Filling at the signal close is the
+    classic backtest leak.
+  * If one bar spans both stop and target, the adverse leg is assumed first.
+  * Slippage is always adverse: buys fill higher, sells fill lower.
+
+Fee rate defaults to 10 bps (Binance spot taker) versus the 4 bps the research
+assumed, so this run answers the open "stressed costs" question directly.
+"""
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import math
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+BAR_MS = 3_600_000
+
+CONFIG = {
+    "symbol": "ETHUSDT",
+    "timeframe": "1h",
+    "initial_capital": 10000.0,
+    "fee_rate": 0.0010,
+    "slippage": 0.0002,
+    "risk_fraction": 0.01,
+    "max_position_fraction": 0.20,
+    # INHERITED, NOT APPLIED HERE. Volatility targeting is computed upstream in
+    # regime_trend_shadow.py, which writes a `vol_scalar` into each signal; this
+    # module only consumes that scalar in size_position(). These two keys are
+    # published because the dashboard renders them alongside the rest of the
+    # config, and removing them would break that -- but editing them here changes
+    # nothing at all, which previously read as though it did. If you are tuning
+    # volatility targeting, change regime_trend_shadow.py's CONFIG.
+    "volatility_target": 0.20,
+    "volatility_lookback": 72,
+    "emergency_stop_loss_pct": 0.20,
+    "disabled_take_profit_pct": 1.00,
+    "trailing_distance_pct": 0.10,
+    "entry_fill": "next_bar_open",
+    "intra_bar_priority": "stop_before_target",
+}
+
+# Demotion policy. Env-overridable so the choice is a one-word change, not a
+# code edit. "flatten" is option C (stop entries and flatten), "stop_entries" is
+# option A (stop new entries, keep managing the open position), "flag" is
+# option B (flag only, keep trading). Defaults to "flatten" per the current
+# instruction. Exits are never suppressed under any policy.
+DEMOTION_MODE = str(os.environ.get("ETH_DEMOTION_MODE", "flatten")).strip().lower()
+
+CODE_VERSION = "1.0.0"
+HISTORY_LIMIT = 5000
+# The shadow feed is written hourly; if it is older than this the engine refuses
+# to act rather than trading on a signal it can no longer attribute.
+MAX_SIGNAL_AGE_SECONDS = 7200
+TRADE_LOG_LIMIT = 5000
+
+
+def env(name, default):
+    value = os.environ.get(name)
+    return value if value else default
+
+
+HOME = Path(env("REGIME_TREND_HOME", str(Path.home())))
+STATE_DIR = Path(env("REGIME_TREND_STATE_DIR", str(HOME / "trading/paper-benchmark")))
+SHADOW_STATE = Path(env("REGIME_TREND_SHADOW", str(STATE_DIR / "regime-trend-shadow.json")))
+SHADOW_HISTORY = Path(
+    env("REGIME_TREND_HISTORY", str(STATE_DIR / "regime-trend-shadow-history.jsonl"))
+)
+STATE = Path(env("ETH_PAPER_STATE", str(STATE_DIR / "eth-paper-execution.json")))
+# Readiness report the demotion verdict is read from. If it is missing we treat
+# demotion as inactive (fail-open) so a transient report gap never silently halts
+# paper accounting; the verdict only ever *stops new entries*, never blocks exits.
+READINESS = Path(
+    env("REGIME_TREND_READINESS", str(STATE_DIR / "evidence-readiness.json"))
+)
+# The dashboard payload and the machine state are different shapes and must not
+# share a file: persisting the payload and reloading it as state loses the
+# counters and breaks the next run.
+INTERNAL_STATE = Path(
+    env("ETH_PAPER_INTERNAL_STATE", str(STATE_DIR / "eth-paper-execution-state.json"))
+)
+TRADE_LOG = Path(env("ETH_PAPER_TRADES", str(STATE_DIR / "eth-paper-execution-trades.jsonl")))
+PUBLIC = Path(
+    env("REGIME_TREND_FEEDS", str(HOME / "trading/openalice/ui/public/eth-paper-execution.json"))
+)
+
+
+def get_json(url, timeout=15):
+    request = urllib.request.Request(url, headers={"User-Agent": "eth-paper-execution/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text(errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_atomic(path, encoded):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(encoded)
+    tmp.replace(path)
+
+
+def fetch_klines(start_ms, end_ms):
+    rows = []
+    cursor = start_ms
+    while cursor < end_ms:
+        url = (
+            f"{BINANCE_KLINES}?symbol={CONFIG['symbol']}&interval=1h"
+            f"&limit=1000&startTime={cursor}&endTime={end_ms}"
+        )
+        batch = get_json(url)
+        if not batch:
+            break
+        rows.extend(batch)
+        cursor = int(batch[-1][0]) + BAR_MS
+        if len(batch) < 1000:
+            break
+    return [row for row in rows if int(row[6]) < end_ms]
+
+
+def load_signal_index():
+    """{candle_close_ms: signal} from the shadow history, so backfill is possible."""
+    index = {}
+    if not SHADOW_HISTORY.exists():
+        return index
+    for line in SHADOW_HISTORY.read_text(errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for signal in entry.get("signals", []):
+            if signal.get("symbol") != CONFIG["symbol"]:
+                continue
+            close_ms = signal.get("candle_close_ms")
+            if close_ms:
+                index[int(close_ms)] = signal
+    return index
+
+
+def default_state():
+    return {
+        "cash": CONFIG["initial_capital"],
+        "position": None,
+        "pending_entry": False,
+        "last_processed_bar_close_ms": None,
+        "equity_curve": [],
+        "fills": 0,
+        "fees_paid": 0.0,
+        "slippage_paid": 0.0,
+        "realized_pnl": 0.0,
+        "entries": 0,
+        "exits": 0,
+        "wins": 0,
+        "losses": 0,
+    }
+
+
+def state_from_payload(payload):
+    """Rebuild internal state from a previously published payload.
+
+    The dashboard payload is not the machine state, so a deployment that only
+    ever wrote payloads would otherwise reload a shape with no counters and fail
+    on the first new bar. Counters are recoverable from `stats`.
+    """
+    stats = payload.get("stats") or {}
+    state = default_state()
+    for key in (
+        "cash",
+        "realized_pnl",
+        "fees_paid",
+        "slippage_paid",
+        "equity_curve",
+        "last_processed_bar_close_ms",
+    ):
+        if payload.get(key) is not None:
+            state[key] = payload[key]
+    state["position"] = payload.get("position") or None
+    state["entries"] = int(stats.get("trades") or 0)
+    state["exits"] = int(stats.get("closed") or 0)
+    state["wins"] = int(stats.get("wins") or 0)
+    state["losses"] = int(stats.get("losses") or 0)
+    state["fills"] = int(stats.get("fills") or 0)
+    return state
+
+
+def load_state():
+    """Load internal state, tolerating a missing or partial file.
+
+    Defaults are always applied first, so a truncated or older file cannot
+    raise KeyError partway through a run and silently stop all paper accounting.
+    """
+    state = default_state()
+    stored = read_json(INTERNAL_STATE)
+    if stored:
+        for key, value in stored.items():
+            if key in state:
+                state[key] = value
+        return state
+    payload = read_json(STATE)
+    if payload:
+        return state_from_payload(payload)
+    return state
+
+
+def size_position(equity, fill_price, stop, vol_scalar):
+    """Vol-targeted risk sizing, matching the research evaluator's contract."""
+    risk_per_unit = abs(fill_price - stop)
+    if risk_per_unit <= 0 or equity <= 0:
+        return 0.0
+    quantity = equity * CONFIG["risk_fraction"] / risk_per_unit
+    if vol_scalar:
+        # A volatility target may only ever shrink risk. Letting a low realized
+        # vol scale size UP would lever up exactly when risk is understated.
+        quantity *= min(1.0, vol_scalar)
+    cap = equity * CONFIG["max_position_fraction"] / fill_price
+    return min(quantity, cap)
+
+
+def fill_buy(price):
+    return price * (1.0 + CONFIG["slippage"])
+
+
+def fill_sell(price):
+    return price * (1.0 - CONFIG["slippage"])
+
+
+def fee_for(quantity, price):
+    return abs(quantity * price) * CONFIG["fee_rate"]
+
+
+def bar_of(row):
+    return {
+        "open_ms": int(row[0]),
+        "open": float(row[1]),
+        "high": float(row[2]),
+        "low": float(row[3]),
+        "close": float(row[4]),
+        "close_ms": int(row[6]),
+    }
+
+
+def open_long(bar, state, signal, log):
+    reference = float(signal["close"])
+    stop_reference = reference * (1 - CONFIG["emergency_stop_loss_pct"])
+    target = reference * (1 + CONFIG["disabled_take_profit_pct"])
+    equity = state["cash"]
+    vol_scalar = (signal.get("volatility") or {}).get("vol_scalar")
+    quantity = size_position(equity, reference, stop_reference, vol_scalar)
+    if quantity <= 0:
+        return
+    fill = fill_buy(bar["open"])
+    cost = quantity * fill
+    fee = fee_for(quantity, fill)
+    if cost + fee > state["cash"]:
+        return
+    state["cash"] -= cost + fee
+    state["fees_paid"] += fee
+    state["slippage_paid"] += (fill - bar["open"]) * quantity
+    stop = fill * (1 - CONFIG["emergency_stop_loss_pct"])
+    state["position"] = {
+        "side": "BUY",
+        "size": quantity,
+        "entry_price": fill,
+        "entry_bar_open_ms": bar["open_ms"],
+        "entry_time": datetime.fromtimestamp(bar["open_ms"] / 1000, timezone.utc).isoformat(),
+        "entry_fee": fee,
+        "initial_stop": stop,
+        "stop_loss": stop,
+        "take_profit": target,
+        "peak_price": bar["high"],
+        "confidence": signal.get("confidence"),
+        "entry_adx": (signal.get("indicators") or {}).get("adx"),
+        "entry_vol_scalar": vol_scalar,
+        "bars_held": 0,
+    }
+    state["entries"] += 1
+    state["fills"] += 1
+    log.append(
+        {
+            "event": "entry",
+            "bar_open_ms": bar["open_ms"],
+            "reference": reference,
+            "fill": fill,
+            "quantity": quantity,
+            "fee": fee,
+            "stop": stop,
+            "target": target,
+        }
+    )
+
+
+def close_long(bar, state, reason, exit_reference, log):
+    position = state["position"]
+    if not position:
+        return
+    fill = fill_sell(exit_reference)
+    proceeds = position["size"] * fill
+    fee = fee_for(position["size"], fill)
+    state["cash"] += proceeds - fee
+    state["fees_paid"] += fee
+    state["slippage_paid"] += max(0.0, exit_reference - fill) * position["size"]
+    entry_cost = position["entry_price"] * position["size"]
+    entry_fee = position.get("entry_fee", 0.0)
+    # cash already moved by both fees, so net P&L must subtract them once here
+    # for realized_pnl to reconcile against the cash balance.
+    pnl = proceeds - fee - entry_cost - entry_fee
+    state["realized_pnl"] += pnl
+    state["exits"] += 1
+    state["fills"] += 1
+    if pnl > 0:
+        state["wins"] += 1
+    elif pnl < 0:
+        state["losses"] += 1
+    log.append(
+        {
+            "event": "exit",
+            "reason": reason,
+            "bar_open_ms": bar["open_ms"],
+            "entry_price": position["entry_price"],
+            "exit_reference": exit_reference,
+            "stop_in_force": position["stop_loss"],
+            "fill": fill,
+            "quantity": position["size"],
+            "fee": fee,
+            "pnl": pnl,
+            "return_on_entry": (fill / position["entry_price"] - 1.0) if position["entry_price"] else None,
+            "bars_held": position.get("bars_held", 0),
+        }
+    )
+    state["position"] = None
+
+
+def check_exit(bar, state, log):
+    """Stops/targets resolve within the bar; adverse leg assumed first.
+
+    Exits are tested against the stop in force at the START of the bar, then
+    the trailing stop ratchets on the close. Ratcheting first would let a bar's
+    own high raise a stop and then claim that same bar's low had hit it.
+    """
+    position = state["position"]
+    if not position:
+        return
+    position["bars_held"] = position.get("bars_held", 0) + 1
+    hit_stop = bar["low"] <= position["stop_loss"]
+    hit_target = bar["high"] >= position["take_profit"]
+    if hit_stop or hit_target:
+        # A single wide bar can contain both; assume the adverse leg first.
+        if hit_stop and hit_target:
+            reason, reference = "stop_and_target_same_bar", position["stop_loss"]
+        elif hit_stop:
+            reason, reference = "stop", position["stop_loss"]
+        else:
+            reason, reference = "target", position["take_profit"]
+        close_long(bar, state, reason, reference, log)
+        return
+    position["peak_price"] = max(position["peak_price"], bar["high"])
+    position["stop_loss"] = max(
+        position["stop_loss"],
+        position["peak_price"] * (1 - CONFIG["trailing_distance_pct"]),
+    )
+
+
+def mark_equity(state, mark):
+    if state["position"]:
+        return state["cash"] + state["position"]["size"] * mark
+    return state["cash"]
+
+
+def demotion_verdict():
+    """Return (entries_blocked, flatten, reason) from the readiness report.
+
+    Fail-open: a missing or unreadable report is treated as NOT retired, so a
+    transient report gap never silently halts paper accounting. The verdict only
+    ever suppresses new entries -- it never blocks exits, and it can never open a
+    position.
+
+    Demotion and abandonment both suppress entries, but only a demotion
+    flattens. A negative CI says the strategy loses money and an open position
+    should be cut. A completed full-horizon read that merely found nothing says
+    we could not detect an edge -- weaker evidence, so the open position keeps
+    being managed and no forced exit is invented on the strength of a null
+    result.
+    """
+    report = read_json(READINESS)
+    if not report:
+        return False, False, "readiness report unavailable; treating as not retired"
+    if report.get("demotion_active") is True:
+        primary = report.get("primary_horizon") or "?"
+        info = report.get("primary") or {}
+        return (
+            True,
+            True,
+            f"readiness reports a negative edge on the {primary} horizon "
+            f"(n={info.get('samples')}, verdict={info.get('verdict')})",
+        )
+    if report.get("abandoned") is True:
+        full = report.get("full_horizon") or "?"
+        info = report.get("full") or {}
+        return (
+            True,
+            False,
+            f"readiness reports no detectable edge after the full {full} horizon "
+            f"(n={info.get('samples')}, verdict={info.get('verdict')}); "
+            "retiring entries, managing the open position",
+        )
+    return False, False, None
+
+
+def run():
+    shadow = read_json(SHADOW_STATE)
+    if not shadow or shadow.get("mode") != "shadow":
+        return None, "shadow feed missing or not in shadow mode; refusing to act"
+    if shadow.get("orders_submitted"):
+        return None, "shadow feed reports orders_submitted; aborting"
+    generated = shadow.get("generated_at")
+    try:
+        age_seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(generated)).total_seconds()
+    except (TypeError, ValueError):
+        return None, "shadow feed has no usable generated_at"
+    if age_seconds > MAX_SIGNAL_AGE_SECONDS:
+        return None, f"shadow feed stale ({int(age_seconds)}s > {MAX_SIGNAL_AGE_SECONDS}s)"
+    index = load_signal_index()
+    if not index:
+        return None, "shadow history has no signal for this symbol"
+
+    state = load_state()
+    log = []
+    retired, flatten_now, retirement_reason = demotion_verdict()
+    # Three distinct policies, and they must not collapse into each other:
+    #   "flatten"      option C - stop new entries AND flatten any open position
+    #   "stop_entries" option A - stop new entries, keep managing the position
+    #   "flag"         option B - record the verdict only, keep trading normally
+    # Only the first two suppress entries; "flag" is purely informational.
+    # A retirement is an entry stop either way. Flattening additionally requires
+    # demotion_active, so an abandoned (inconclusive) candidate stops opening but
+    # does not have its open position cut on the strength of a null result.
+    entries_blocked = retired and DEMOTION_MODE in {"flatten", "stop_entries"}
+    flatten_on_demotion = flatten_now and DEMOTION_MODE == "flatten"
+    demotion_active = retired
+    demotion_reason = retirement_reason
+    last = state.get("last_processed_bar_close_ms")
+    start_ms = int(last) if last else max(index) - 2 * BAR_MS
+    now_ms = int(time.time() * 1000)
+    bars = fetch_klines(start_ms + 1, now_ms)
+    bars = [bar_of(row) for row in bars]
+    bars = [bar for bar in bars if bar["close_ms"] > start_ms]
+    if not bars:
+        return None, "no new closed bars to process"
+
+    for bar in bars:
+        if state.get("pending_entry"):
+            signal = index.get(bar["close_ms"] - BAR_MS)
+            if signal and signal.get("signal") == "BUY" and not entries_blocked:
+                open_long(bar, state, signal, log)
+            state["pending_entry"] = False
+        # Exits are never gated: once demoted we still manage the position we
+        # already hold (stops/targets/trailing) and the FLAT branch still closes
+        # it. Only NEW entries are suppressed.
+        check_exit(bar, state, log)
+        signal = index.get(bar["close_ms"])
+        if signal and signal.get("signal") == "BUY":
+            if not state["position"] and not entries_blocked:
+                state["pending_entry"] = True
+        else:
+            # Unknown or FLAT signal: a long-only regime strategy goes flat.
+            if state["position"]:
+                close_long(bar, state, "flat_signal", bar["close"], log)
+        state["last_processed_bar_close_ms"] = bar["close_ms"]
+
+    # Option C flatten: close any surviving position on the latest close, tagged
+    # as a demotion exit so it is distinguishable from a signal-driven flat. This
+    # runs after the normal loop so normal exits (stops/targets/trailing) have
+    # already been given their chance at better prices.
+    if flatten_on_demotion and state.get("position"):
+        last_bar = bars[-1]
+        close_long(last_bar, state, "demotion_flatten", last_bar["close"], log)
+
+    if not log and not state.get("last_processed_bar_close_ms"):
+        return None, "nothing processed"
+
+    mark = bars[-1]["close"]
+    equity = mark_equity(state, mark)
+    position = state["position"]
+    unrealized = 0.0
+    if position:
+        unrealized = (mark - position["entry_price"]) * position["size"]
+    trades = state["entries"]
+    wins, losses = state["wins"], state["losses"]
+    state["equity_curve"].append({"t": bars[-1]["close_ms"], "equity": equity})
+    state["equity_curve"] = state["equity_curve"][-2000:]
+
+    if log:
+        with TRADE_LOG.open("a") as handle:
+            for item in log:
+                handle.write(json.dumps({"generated_at": datetime.now(timezone.utc).isoformat(), **item}) + "\n")
+        try:
+            lines = TRADE_LOG.read_text(errors="ignore").splitlines()
+            if len(lines) > TRADE_LOG_LIMIT:
+                write_atomic(TRADE_LOG, "\n".join(lines[-TRADE_LOG_LIMIT:]) + "\n")
+        except OSError:
+            pass
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "code_version": CODE_VERSION,
+        "strategy": "regime_aware_trend_1h",
+        "mode": "paper",
+        "paper_only": True,
+        "orders_submitted": False,
+        "live_orders_allowed": False,
+        "symbol": CONFIG["symbol"],
+        "timeframe": CONFIG["timeframe"],
+        "data_source": "public_klines",
+        "signal_source": "regime-trend-shadow.json",
+        "signal_fingerprint": shadow.get("code_fingerprint"),
+        "status": "ok",
+        "config": CONFIG,
+        "assumptions": {
+            "entry_fill": CONFIG["entry_fill"],
+            "intra_bar_priority": CONFIG["intra_bar_priority"],
+            "volatility_target_applied_by": "regime_trend_shadow.py",
+            "slippage_adverse": True,
+            "fee_note": "10bps spot taker vs 4bps research assumption",
+        },
+        "shadow_signal_age_seconds": int(age_seconds),
+        "gating": {
+            # Deliberate, not an oversight. The fleet promotion controller
+            # (paper-benchmark/promotion.json) gates the *other* system's
+            # pre-registered arms via their executor's entry_allowed check.
+            # This candidate is validated by its own forward evidence, and in
+            # paper an unproven signal is harmless: executing it is how the
+            # fills, slippage and fee drag get measured at all. Gating paper
+            # execution on this candidate's own evidence would be circular --
+            # it would refuse to trade exactly when there is no execution
+            # evidence yet. Revisit only if the two systems are unified, at
+            # which point both gates must clear.
+            "consults_promotion_controller": False,
+            "reason": "collects execution evidence; paper-only, no order path",
+            "orders_possible": False,
+            "consults_readiness_demotion": True,
+            "demotion_active": demotion_active,
+            "demotion_entries_blocked": entries_blocked,
+            "demotion_reason": demotion_reason,
+            "demotion_mode": DEMOTION_MODE,
+            "exits_never_blocked": True,
+        },
+        "initial_capital": CONFIG["initial_capital"],
+        "cash": state["cash"],
+        "equity": equity,
+        "realized_pnl": state["realized_pnl"],
+        "unrealized_pnl": unrealized,
+        "total_return_pct": (equity / CONFIG["initial_capital"] - 1.0) * 100.0,
+        "fees_paid": state["fees_paid"],
+        "slippage_paid": state["slippage_paid"],
+        "position": {
+            **{k: v for k, v in (position or {}).items()},
+            "mark": mark,
+            "unrealized_pct": ((mark / position["entry_price"] - 1.0) * 100.0) if position else None,
+        } if position else None,
+        "stats": {
+            "trades": trades,
+            "closed": state["exits"],
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / (wins + losses)) if (wins + losses) else None,
+            "fills": state["fills"],
+        },
+        "last_processed_bar_close_ms": state["last_processed_bar_close_ms"],
+        "bars_processed_this_run": len(bars),
+        "events_this_run": log,
+        "equity_curve": state["equity_curve"],
+    }
+    encoded = json.dumps(payload, indent=2)
+    # Machine state is persisted separately from the dashboard payload: reloading
+    # the payload as state loses the counters and breaks the next run.
+    write_atomic(INTERNAL_STATE, json.dumps(state, indent=2, default=str))
+    write_atomic(STATE, encoded)
+    write_atomic(PUBLIC, encoded)
+    return payload, None
+
+
+def main():
+    try:
+        payload, error = run()
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+        print(f"eth-paper-execution: FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    if error:
+        print(f"eth-paper-execution: no update: {error}", file=sys.stderr)
+        return 0
+    pos = "long" if payload["position"] else "flat"
+    print(
+        f"eth-paper-execution: equity={payload['equity']:.2f} "
+        f"({payload['total_return_pct']:+.2f}%) pos={pos} "
+        f"trades={payload['stats']['trades']} fees={payload['fees_paid']:.2f} "
+        f"bars={payload['bars_processed_this_run']} events={len(payload['events_this_run'])}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

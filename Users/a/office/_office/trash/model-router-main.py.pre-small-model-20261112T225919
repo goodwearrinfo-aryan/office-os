@@ -1,0 +1,344 @@
+import os
+import yaml
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+import httpx
+import asyncio
+from prometheus_client import Counter, Histogram, generate_latest
+from fastapi.responses import Response
+import logging
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Model Router", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8600", "http://127.0.0.1:8600", "http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Prometheus metrics
+REQUEST_COUNT = Counter('model_router_requests_total', 'Total requests', ['model', 'status'])
+REQUEST_DURATION = Histogram('model_router_request_duration_seconds', 'Request duration', ['model'])
+HALLUCINATION_COUNTER = Counter('model_hallucination_total', 'Hallucination detections', ['model'])
+
+# Load config
+with open("/Users/a/ai-office/config/config.yaml") as f:
+    CONFIG = yaml.safe_load(f)
+
+MODEL_CONFIG = {m['name']: m for m in CONFIG['model_router']['models']}
+ROUTING_RULES = CONFIG['model_router']['routing_rules']
+CACHE_CONFIG = CONFIG['model_router'].get('cache', {'enabled': True, 'ttl_seconds': 3600, 'max_size_mb': 1024})
+
+# Simple in-memory cache
+cache = {}
+cache_timestamps = {}
+
+class CompletionRequest(BaseModel):
+    model: str = Field(..., description="Model name (nim-llm, nim-code, nim-finance, nim-bio)")
+    prompt: str = Field(..., description="Input prompt")
+    max_tokens: int = Field(..., ge=1, le=4096)
+    temperature: float = Field(0.7, ge=0, le=2)
+
+class CompletionResponse(BaseModel):
+    id: str
+    choices: List[Dict[str, Any]]
+    usage: Dict[str, int]
+
+class ThinkMaxRequest(BaseModel):
+    prompt: str = Field(..., description="Input prompt for orchestration")
+    max_tokens: int = Field(400, ge=1, le=2000)
+    temperature: float = Field(0.7, ge=0, le=2)
+
+class ThinkMaxResponse(BaseModel):
+    final_answer: str
+    draft: str
+    models: List[str]
+
+async def route_model(request: CompletionRequest) -> str:
+    """Route request to appropriate model based on routing rules"""
+    for rule in ROUTING_RULES:
+        import re
+        if re.match(rule['pattern'], request.model):
+            return rule['model']
+    # Default to first model
+    return CONFIG['model_router']['models'][0]['name']
+
+def get_cache_key(request: CompletionRequest) -> str:
+    import hashlib
+    content = f"{request.model}:{request.prompt}:{request.max_tokens}:{request.temperature}"
+    return hashlib.md5(content.encode()).hexdigest()
+
+def get_cached_response(key: str) -> Optional[Dict]:
+    if not CACHE_CONFIG.get('enabled', True):
+        return None
+    if key in cache:
+        if time.time() - cache_timestamps[key] < CACHE_CONFIG['ttl_seconds']:
+            return cache[key]
+        else:
+            del cache[key]
+            del cache_timestamps[key]
+    return None
+
+def set_cache(key: str, value: Dict):
+    if not CACHE_CONFIG.get('enabled', True):
+        return
+    cache[key] = value
+    cache_timestamps[key] = time.time()
+
+async def call_model(model_name: str, request: CompletionRequest) -> Dict:
+    """Call local ollama (no rate limits, no API key)."""
+    model_config = MODEL_CONFIG[model_name]
+    model_id = model_config.get('model_id', 'qwen2.5:7b')
+    endpoint = CONFIG.get('endpoint', 'http://127.0.0.1:11434/v1/chat/completions')
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(
+            endpoint,
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": request.prompt}],
+                "max_tokens": request.max_tokens,
+                "temperature": request.temperature,
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        return {
+            "id": f"cmpl-{int(time.time())}",
+            "choices": [{
+                "text": text,
+                "finish_reason": (data.get("choices") or [{}])[0].get("finish_reason") or "stop",
+            }],
+            "usage": {
+                "prompt_tokens": len(request.prompt.split()),
+                "completion_tokens": len(text.split()),
+                "total_tokens": len(request.prompt.split()) + len(text.split()),
+            },
+        }
+
+
+async def call_ollama_raw(model_id: str, prompt: str,
+                          max_tokens: int, temperature: float) -> str:
+    """Call local ollama with a raw model name (not from config)."""
+    endpoint = CONFIG.get('endpoint', 'http://127.0.0.1:11434/v1/chat/completions')
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(
+            endpoint,
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+
+@app.post("/v1/completions", response_model=CompletionResponse)
+async def create_completion(
+    request: CompletionRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    # Route to appropriate model
+    model_name = await route_model(request)
+    
+    # Check cache
+    cache_key = get_cache_key(request)
+    cached = get_cached_response(cache_key)
+    if cached:
+        REQUEST_COUNT.labels(model=model_name, status="cached").inc()
+        return cached
+    
+    # Call model
+    start_time = time.time()
+    try:
+        result = await call_model(model_name, request)
+        duration = time.time() - start_time
+        
+        REQUEST_DURATION.labels(model=model_name).observe(duration)
+        REQUEST_COUNT.labels(model=model_name, status="success").inc()
+        
+        # Cache response
+        set_cache(cache_key, result)
+        
+        return result
+    except httpx.HTTPStatusError as e:
+        REQUEST_COUNT.labels(model=model_name, status="error").inc()
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        REQUEST_COUNT.labels(model=model_name, status="error").inc()
+        logger.error(f"Error calling model {model_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/chat/completions")
+async def create_chat_completion(
+    request: Dict[str, Any],
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    """OpenAI-compatible chat completions endpoint for CrewAI and other clients."""
+    from pydantic import BaseModel
+    
+    # Convert OpenAI chat format to our CompletionRequest format
+    model = request.get("model", "nim-llm")
+    messages = request.get("messages", [])
+    max_tokens = request.get("max_tokens", 500)
+    temperature = request.get("temperature", 0.7)
+    
+    # Extract prompt from messages
+    prompt = ""
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        prompt += f"{role}: {content}\n"
+    
+    # Call the model via our internal function
+    completion_request = CompletionRequest(
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature
+    )
+    
+    # Route to appropriate model
+    model_name = await route_model(completion_request)
+    
+    # Check cache
+    cache_key = get_cache_key(completion_request)
+    cached = get_cached_response(cache_key)
+    if cached:
+        REQUEST_COUNT.labels(model=model_name, status="cached").inc()
+        return cached
+    
+    # Call model
+    start_time = time.time()
+    try:
+        result = await call_model(model_name, completion_request)
+        duration = time.time() - start_time
+        
+        REQUEST_DURATION.labels(model=model_name).observe(duration)
+        REQUEST_COUNT.labels(model=model_name, status="success").inc()
+        
+        # Return in OpenAI chat format
+        return {
+            "id": result.get("id", f"chatcmpl-{int(time.time())}"),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": result["choices"][0]["text"]
+                },
+                "finish_reason": result["choices"][0].get("finish_reason", "stop")
+            }],
+            "usage": result.get("usage", {})
+        }
+    except httpx.HTTPStatusError as e:
+        REQUEST_COUNT.labels(model=model_name, status="error").inc()
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        REQUEST_COUNT.labels(model=model_name, status="error").inc()
+        logger.error(f"Error in chat completion for {model_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def retrieve_context(query: str, limit: int = 3) -> str:
+    """Retrieve relevant context from the local Qdrant retrieval service."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "http://127.0.0.1:8001/api/v1/retrieve",
+                json={"query": query, "top_k": limit},
+            )
+            if response.status_code == 200:
+                data = response.json()
+                chunks = data.get("chunks", [])
+                if chunks:
+                    context_parts = []
+                    for chunk in chunks:
+                        text = chunk.get("text", "")
+                        score = chunk.get("score", 0)
+                        context_parts.append(f"[Context (score: {score:.2f})] {text}")
+                    return "\n".join(context_parts)
+    except Exception as e:
+        logger.warning(f"Retrieval failed: {e}")
+    return ""
+
+
+@app.post("/v1/think-max", response_model=ThinkMaxResponse)
+async def think_max(request: ThinkMaxRequest):
+    """Multi-model consensus with RAG: draft with gemma3:1b (fast), refine with gemma3:1b (smart)."""
+    start_time = time.time()
+
+    try:
+        # Step 0: Retrieve relevant context from Qdrant
+        context = await retrieve_context(request.prompt, limit=3)
+        context_block = f"\nRelevant context:\n{context}\n" if context else ""
+
+        # Step 1: Fast draft with gemma3:1b (with RAG context)
+        draft = await call_ollama_raw(
+            "mlx-community/Qwen3-8B-4bit",
+            request.prompt + context_block,
+            request.max_tokens,
+            request.temperature,
+        )
+
+        # Step 2: Critique and refine with gemma3:1b (with RAG context)
+        critique_prompt = f"""Review this draft answer and improve it. Fix errors, add clarity, remove fluff. Use the provided context where relevant. Return only the improved final answer.
+
+Original question: {request.prompt}
+{context_block}
+Draft answer:
+{draft}
+
+Improved answer:"""
+
+        final = await call_ollama_raw(
+            "mlx-community/Qwen3-8B-4bit", critique_prompt,
+            request.max_tokens, request.temperature,
+        )
+
+        duration = time.time() - start_time
+        REQUEST_DURATION.labels(model="think-max").observe(duration)
+        REQUEST_COUNT.labels(model="think-max", status="success").inc()
+
+        return ThinkMaxResponse(
+            final_answer=final,
+            draft=draft,
+            models=["mlx-community/Qwen3-8B-4bit", "mlx-community/Qwen3-8B-4bit"],
+        )
+    except Exception as e:
+        REQUEST_COUNT.labels(model="think-max", status="error").inc()
+        logger.error(f"Error in think-max: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "model-router"}
+
+@app.get("/ready")
+async def ready():
+    return {"status": "ready"}
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type="text/plain")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8003)

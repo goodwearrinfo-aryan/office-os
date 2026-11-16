@@ -1,0 +1,361 @@
+"""Research-only 1h shadow signal feed for regime_aware_trend_1h.
+
+Signals are recorded for later out-of-period validation. Nothing here executes:
+no exchange client, no credentials, no order path. The only network call is the
+public, keyless Binance klines endpoint.
+
+Indicator math intentionally mirrors trading-bot/strategies/strategies.py:
+  ema  -> ewm(span=period, adjust=False).mean()
+  atr  -> rolling(period).mean() of the true range
+  adx  -> Wilder-style smoothed directional index
+and trading-bot/strategy_evaluator.py for volatility targeting:
+  realized vol -> log returns .rolling(lookback).std() * sqrt(bars_per_year)
+"""
+from datetime import datetime, timezone
+from pathlib import Path
+import hashlib
+import json
+import math
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+INTERVAL = "1h"
+BAR_MINUTES = 60
+BARS_PER_YEAR = 365.0 * 24.0 * 60.0 / BAR_MINUTES
+MAX_KLINES_PER_REQUEST = 1000
+CODE_VERSION = "1.0.0"
+
+CONFIG = {
+    "fast_period": 48,
+    "slow_period": 384,
+    "trend_period": 200,
+    "adx_period": 14,
+    "adx_min": 8.0,
+    "min_confidence": 0.65,
+    "emergency_stop_loss_pct": 0.20,
+    "disabled_take_profit_pct": 1.00,
+    "trailing_distance_pct": 0.10,
+    "volatility_target": 0.20,
+    "volatility_lookback": 72,
+    "base_notional_fraction": 0.20,
+}
+
+HISTORY_LIMIT = 5000
+
+
+def env(name, default):
+    value = os.environ.get(name)
+    return value if value else default
+
+
+def code_fingerprint():
+    """Stable id for the exact code + config that produced a signal.
+
+    Historical entries are only evidence if the generating code can be pinned,
+    so every payload carries a hash of the config plus the module source.
+    """
+    digest = hashlib.sha256()
+    digest.update(CODE_VERSION.encode())
+    digest.update(json.dumps(CONFIG, sort_keys=True).encode())
+    try:
+        digest.update(Path(__file__).resolve().read_bytes())
+    except OSError:
+        pass
+    return digest.hexdigest()[:16]
+
+
+HOME = Path(env("REGIME_TREND_HOME", str(Path.home())))
+SYMBOLS = [
+    item.strip().upper()
+    for item in env("REGIME_TREND_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT").split(",")
+    if item.strip()
+]
+STATE = Path(env("REGIME_TREND_STATE", str(HOME / "trading/paper-benchmark/regime-trend-shadow.json")))
+PUBLIC = Path(
+    env("REGIME_TREND_FEEDS", str(HOME / "trading/openalice/ui/public/regime-trend-shadow.json"))
+)
+HISTORY = Path(
+    env("REGIME_TREND_HISTORY", str(HOME / "trading/paper-benchmark/regime-trend-shadow-history.jsonl"))
+)
+FETCH_RETRIES = int(env("REGIME_TREND_RETRIES", "3"))
+STALE_SECONDS = int(env("REGIME_TREND_STALE_SECONDS", "9000"))
+# Mirrors RegimeAwareTrend1hStrategy.min_bars so we never publish a signal the
+# runtime strategy itself would refuse to evaluate.
+MIN_BARS = (
+    max(
+        CONFIG["fast_period"],
+        CONFIG["slow_period"],
+        CONFIG["trend_period"],
+        CONFIG["adx_period"] * 2,
+    )
+    + 1
+)
+
+
+def get_json(url, timeout=15):
+    request = urllib.request.Request(url, headers={"User-Agent": "regime-trend-shadow/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def fetch_klines(symbol, limit=2000):
+    """Public Binance 1h klines, newest last, forming candle excluded."""
+    now_ms = int(time.time() * 1000)
+    rows = []
+    end_ms = now_ms
+    while len(rows) < limit:
+        want = min(MAX_KLINES_PER_REQUEST, limit - len(rows))
+        url = (
+            f"{BINANCE_KLINES}?symbol={symbol}&interval={INTERVAL}"
+            f"&limit={want}&endTime={end_ms}"
+        )
+        batch = get_json(url)
+        if not batch:
+            break
+        rows = batch + rows
+        end_ms = int(batch[0][0]) - 1
+        if len(batch) < want:
+            break
+    closed = [row for row in rows if int(row[6]) < now_ms]
+    if not closed:
+        raise ValueError(f"{symbol}: no closed candles returned")
+    return closed[-limit:]
+
+
+def ema(values, period):
+    alpha = 2.0 / (period + 1.0)
+    out = []
+    current = None
+    for value in values:
+        current = value if current is None else alpha * value + (1.0 - alpha) * current
+        out.append(current)
+    return out
+
+
+def rolling_mean(values, period):
+    """Mirrors pandas .rolling(window=period).mean(): NaN anywhere -> NaN window."""
+    out = [None] * len(values)
+    for index in range(period - 1, len(values)):
+        window = values[index - period + 1: index + 1]
+        if any(item is None for item in window):
+            continue
+        out[index] = sum(window) / period
+    return out
+
+
+def rolling_std(values, period):
+    """Mirrors pandas .rolling(window=period).std() (ddof=1)."""
+    out = [None] * len(values)
+    for index in range(period - 1, len(values)):
+        window = values[index - period + 1: index + 1]
+        if any(item is None for item in window):
+            continue
+        mean = sum(window) / period
+        variance = sum((item - mean) ** 2 for item in window) / (period - 1)
+        out[index] = math.sqrt(variance) if variance > 0 else 0.0
+    return out
+
+
+def true_range(highs, lows, closes):
+    """First bar is None because true range needs a prior close (pandas shift)."""
+    out = [None]
+    for index in range(1, len(highs)):
+        previous = closes[index - 1]
+        out.append(
+            max(
+                highs[index] - lows[index],
+                abs(highs[index] - previous),
+                abs(lows[index] - previous),
+            )
+        )
+    return out
+
+
+def adx_series(highs, lows, closes, period):
+    tr = rolling_mean(true_range(highs, lows, closes), period)
+    plus_dm = rolling_mean([None] + [max(0.0, highs[i] - highs[i - 1]) for i in range(1, len(highs))], period)
+    minus_dm = rolling_mean([None] + [max(0.0, lows[i - 1] - lows[i]) for i in range(1, len(lows))], period)
+    dx = [None] * len(closes)
+    for index in range(len(closes)):
+        tr_value = tr[index]
+        if tr_value in (None, 0) or plus_dm[index] is None or minus_dm[index] is None:
+            continue
+        plus_di = 100.0 * plus_dm[index] / tr_value
+        minus_di = 100.0 * minus_dm[index] / tr_value
+        total = plus_di + minus_di
+        dx[index] = 100.0 * abs(plus_di - minus_di) / total if total > 0 else 0.0
+    return rolling_mean(dx, period)
+
+
+def realized_volatility(closes, lookback):
+    log_returns = [None]
+    for index in range(1, len(closes)):
+        if closes[index - 1] > 0 and closes[index] > 0:
+            log_returns.append(math.log(closes[index] / closes[index - 1]))
+    value = rolling_std(log_returns, lookback)[-1]
+    if value is None or value <= 0:
+        return None
+    return value * math.sqrt(BARS_PER_YEAR)
+
+
+def analyze(rows):
+    if len(rows) < MIN_BARS:
+        raise ValueError(f"insufficient bars: {len(rows)} < {MIN_BARS}")
+    opens = [float(row[0]) for row in rows]
+    highs = [float(row[1]) for row in rows]
+    lows = [float(row[2]) for row in rows]
+    closes = [float(row[4]) for row in rows]
+    volumes = [float(row[5]) for row in rows]
+
+    fast = ema(closes, CONFIG["fast_period"])
+    slow = ema(closes, CONFIG["slow_period"])
+    trend = ema(closes, CONFIG["trend_period"])
+    adx = adx_series(highs, lows, closes, CONFIG["adx_period"])
+    close = closes[-1]
+    adx_value = adx[-1] or 0.0
+    vol = realized_volatility(closes, CONFIG["volatility_lookback"])
+
+    trend_ok = fast[-1] > slow[-1] and close > trend[-1]
+    adx_ok = adx_value >= CONFIG["adx_min"]
+    signal = "BUY" if (trend_ok and adx_ok) else "FLAT"
+    confidence = (
+        min(1.0, max(CONFIG["min_confidence"], 0.60 + adx_value / 200.0)) if signal == "BUY" else 1.0
+    )
+    vol_scalar = (
+        min(1.0, CONFIG["volatility_target"] / vol) if vol and vol > 0 else None
+    )
+    reason = (
+        f"1h EMA regime confirmed; ADX {adx_value:.1f}"
+        if signal == "BUY"
+        else "1h trend or regime filter inactive"
+    )
+    return {
+        "signal": signal,
+        "confidence": round(confidence, 4),
+        "regime": "trending_up" if signal == "BUY" else "volatile",
+        "reason": reason,
+        "close": round(close, 8),
+        "open": round(opens[-1], 8),
+        "high": round(highs[-1], 8),
+        "low": round(lows[-1], 8),
+        "volume": volumes[-1],
+        "candle_open_ms": int(rows[-1][0]),
+        "candle_close_ms": int(rows[-1][6]),
+        "candle_close_utc": datetime.fromtimestamp(int(rows[-1][6]) / 1000, timezone.utc).isoformat(),
+        "bars_available": len(rows),
+        "indicators": {
+            "ema_fast": round(fast[-1], 8),
+            "ema_slow": round(slow[-1], 8),
+            "ema_trend": round(trend[-1], 8),
+            "adx": round(adx_value, 4),
+        },
+        "levels": {
+            "entry_reference": round(close, 8),
+            "stop_loss": round(close * (1 - CONFIG["emergency_stop_loss_pct"]), 8),
+            "take_profit": round(close * (1 + CONFIG["disabled_take_profit_pct"]), 8),
+            "trailing_stop": round(close * (1 - CONFIG["trailing_distance_pct"]), 8),
+        },
+        "volatility": {
+            "target": CONFIG["volatility_target"],
+            "lookback": CONFIG["volatility_lookback"],
+            "realized": round(vol, 6) if vol else None,
+            "vol_scalar": round(vol_scalar, 4) if vol_scalar is not None else None,
+            "suggested_notional_fraction": round(CONFIG["base_notional_fraction"] * vol_scalar, 4)
+            if vol_scalar is not None
+            else None,
+        },
+        "filters": {"trend_ok": trend_ok, "adx_ok": adx_ok},
+    }
+
+
+def fetch_symbol(symbol):
+    last_error = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            return analyze(fetch_klines(symbol)), None
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < FETCH_RETRIES:
+                time.sleep(min(10, 2 ** attempt))
+    return None, last_error
+
+
+def write_atomic(path, encoded):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(encoded)
+    tmp.replace(path)
+
+
+def append_history(payload):
+    HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    with HISTORY.open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "generated_at": payload["generated_at"],
+                    "code_version": payload["code_version"],
+                    "code_fingerprint": payload["code_fingerprint"],
+                    "config": payload["config"],
+                    "signals": payload["signals"],
+                }
+            )
+            + "\n"
+        )
+    try:
+        lines = HISTORY.read_text(errors="ignore").splitlines()
+        if len(lines) > HISTORY_LIMIT:
+            write_atomic(HISTORY, "\n".join(lines[-HISTORY_LIMIT:]) + "\n")
+    except OSError:
+        pass
+
+
+def main():
+    generated_at = datetime.now(timezone.utc).isoformat()
+    signals = []
+    errors = {}
+    for symbol in SYMBOLS:
+        signal, error = fetch_symbol(symbol)
+        if signal is None:
+            errors[symbol] = error
+            continue
+        signals.append({"symbol": symbol, **signal})
+
+    if not signals:
+        print(f"regime-trend-shadow: no symbols resolved, snapshot left untouched: {errors}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "generated_at": generated_at,
+        "paper_only": True,
+        "orders_submitted": False,
+        "live_orders_allowed": False,
+        "strategy": "regime_aware_trend_1h",
+        "mode": "shadow",
+        "code_version": CODE_VERSION,
+        "code_fingerprint": code_fingerprint(),
+        "timeframe": INTERVAL,
+        "exchange": "binance",
+        "data_source": "public_klines",
+        "status": "ok" if not errors else "degraded",
+        "expected_symbols": SYMBOLS,
+        "stale_after_seconds": STALE_SECONDS,
+        "config": CONFIG,
+        "signals": signals,
+        "errors": errors,
+    }
+    encoded = json.dumps(payload, indent=2)
+    write_atomic(STATE, encoded)
+    write_atomic(PUBLIC, encoded)
+    append_history(payload)
+    active = sum(1 for item in signals if item["signal"] != "FLAT")
+    print(f"regime-trend-shadow: {len(signals)}/{len(SYMBOLS)} symbols, {active} non-flat, status={payload['status']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,35 @@
+model_router:
+  provider: ollama_local
+  endpoint: "http://127.0.0.1:11434/v1/chat/completions"
+  models:
+    - name: nim-llm
+      model_id: "mlx-community/Qwen3-8B-4bit"
+      max_tokens: 4096
+      temperature: 0.7
+    - name: nim-code
+      model_id: "mlx-community/Qwen3-8B-4bit"
+      max_tokens: 4096
+      temperature: 0.3
+    - name: nim-finance
+      model_id: "mlx-community/Qwen3-8B-4bit"
+      max_tokens: 2048
+      temperature: 0.2
+    - name: nim-bio
+      model_id: "mlx-community/Qwen3-8B-4bit"
+      max_tokens: 2048
+      temperature: 0.2
+  routing_rules:
+    - pattern: "^nim-llm$"
+      model: nim-llm
+    - pattern: "^nim-code$"
+      model: nim-code
+    - pattern: "^nim-finance$"
+      model: nim-finance
+    - pattern: "^nim-bio$"
+      model: nim-bio
+    - pattern: ".*"
+      model: nim-llm
+  cache:
+    enabled: true
+    ttl_seconds: 3600
+    max_size_mb: 1024

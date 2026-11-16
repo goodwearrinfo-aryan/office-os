@@ -1,0 +1,149 @@
+{
+  "serverName": "github-mcp",
+  "description": "MCP server for GitHub API integration with repo, issue, and PR management tools",
+  "version": "1.0.0",
+  "protocolVersion": "2026-07-28",
+  "serverInfo": {
+    "name": "github-mcp",
+    "version": "1.0.0"
+  },
+  "capabilities": {
+    "listTools": true,
+    "callTool": true
+  },
+  "tools": {
+    "list_repos": {
+      "description": "List GitHub repositories, optionally filtered by owner, type, sort, and direction.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Filter by owner (username or organization)"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["all", "member", "public", "private", "fork"],
+            "description": "Filter by type (all, member, public, private, fork)"
+          },
+          "sort": {
+            "type": "string",
+            "enum": ["updated", "pushed", "full_name", "name"],
+            "description": "Sort criterion (updated, pushed, full_name, name)"
+          },
+          "direction": {
+            "type": "string",
+            "enum": ["asc", "desc"],
+            "description": "Sort direction (asc, desc)"
+          },
+          "per_page": {
+            "type": "integer",
+            "description": "Number of results per page (default: 30)"
+          },
+          "page": {
+            "type": "integer",
+            "description": "Page number (default: 1)"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    "create_issue": {
+      "description": "Create a GitHub issue with title, body, labels, and assignees.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Repository owner (username or organization)"
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository name"
+          },
+          "title": {
+            "type": "string",
+            "description": "Issue title"
+          },
+          "body": {
+            "type": "string",
+            "description": "Issue body/description"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of label names"
+          },
+          "assignees": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of assignee usernames"
+          }
+        },
+        "required": ["owner", "repo", "title"],
+        "additionalProperties": false
+      }
+    },
+    "create_pr": {
+      "description": "Create a pull request with title, body, head branch, and base branch.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Repository owner (username or organization)"
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository name"
+          },
+          "title": {
+            "type": "string",
+            "description": "PR title"
+          },
+          "body": {
+            "type": "string",
+            "description": "PR body/description"
+          },
+          "head": {
+            "type": "string",
+            "description": "Head branch (format: owner:branch or just branch name)"
+          },
+          "base": {
+            "type": "string",
+            "description": "Base branch (default: main)"
+          }
+        },
+        "required": ["owner", "repo", "title"],
+        "additionalProperties": false
+      }
+    },
+    "get_pull_request": {
+      "description": "Get details of a pull request by number.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Repository owner (username or organization)"
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository name"
+          },
+          "pull_number": {
+            "type": "integer",
+            "description": "Pull request number"
+          }
+        },
+        "required": ["owner", "repo", "pull_number"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
